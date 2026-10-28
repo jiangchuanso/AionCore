@@ -151,6 +151,11 @@ pub struct AionrsResolvedConfig {
     pub max_tool_call_failure_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
+    /// Context window (tokens) configured for this provider, when known.
+    ///
+    /// Drives the engine's own per-call compaction thresholds; `None` leaves
+    /// them at aionrs' conservative default.
+    pub context_limit: Option<i64>,
     /// Directory for aionrs session persistence files.
     pub session_directory: PathBuf,
     /// Session mode (default, auto_edit, yolo).

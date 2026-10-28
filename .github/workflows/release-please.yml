@@ -40,12 +40,23 @@ jobs:
     runs-on: ubuntu-latest
     if: "!startsWith(github.event.head_commit.message, 'chore: release') && !startsWith(github.event.head_commit.message, 'chore(main): release')"
     steps:
+      # `GITHUB_TOKEN` cannot open a PR unless the repository has
+      # "Allow GitHub Actions to create and approve pull requests" enabled
+      # (Settings > Actions > General). A PAT is unaffected by that toggle, so
+      # `RELEASE_PLEASE_TOKEN` is the supported escape hatch; without it we fall
+      # back to the job token and degrade to a warning instead of a red build.
       - uses: googleapis/release-please-action@v5
         id: release-please
+        continue-on-error: true
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Report release PR status
+        if: steps.release-please.outcome == 'failure'
+        run: |
+          echo "::warning title=release-please could not open a release PR::The release PR was not created (typically: 'GitHub Actions is not permitted to create or approve pull requests'). Enable the toggle in Settings > Actions > General, or set a PAT in the RELEASE_PLEASE_TOKEN secret. Tag pushes (v*) still publish through release.yml."
 
       - name: Checkout release PR branch
         if: steps.release-please.outputs.pr

@@ -361,6 +361,18 @@ fn split_base_ext(name: &str) -> (&str, &str) {
     }
 }
 
+/// Resolve `path` against the process working directory when it is relative.
+///
+/// Upload paths are handed back to clients as absolute paths, and the configured
+/// upload root may be relative (the data dir is only guaranteed to be absolute
+/// in the production launcher), so normalise before joining.
+fn absolutize(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+}
+
 /// Get file metadata synchronously.
 fn get_file_metadata_sync(path: &Path) -> Result<FileMetadata, FileError> {
     let metadata = std::fs::metadata(path)
@@ -935,10 +947,10 @@ impl crate::traits::IFileService for FileService {
         let name = file_name.to_owned();
         let bytes = data.to_vec();
 
-        let upload_root = self
-            .upload_root
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("aionui"));
+        let upload_root = match self.upload_root.as_deref() {
+            Some(root) => absolutize(root),
+            None => std::env::temp_dir().join("aionui"),
+        };
 
         // Prefer the conversation workspace so the upload lands next to the files
         // the agent produces for that conversation. Falls back to a staging area
@@ -953,6 +965,7 @@ impl crate::traits::IFileService for FileService {
             (Some(user_id), Some(conversation_id), Some(lookup)) => lookup
                 .workspace_for(user_id, conversation_id)
                 .await
+                .map(|workspace| absolutize(&workspace))
                 .filter(|workspace| workspace.starts_with(&upload_root)),
             _ => None,
         };

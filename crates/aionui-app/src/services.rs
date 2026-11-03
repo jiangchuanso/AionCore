@@ -281,7 +281,11 @@ impl AppServices {
         // `resolve_existing` classifies auto workspaces as temp and
         // user-picked directories as standard.
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
-        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        let project_service = ProjectService::new(project_store, work_dir.join("conversations"))
+            // Chat uploads are written into the conversation workspace (under
+            // `work_dir/conversations`) or the staging area (`work_dir/uploads`),
+            // so chat-file containment must accept the whole work dir.
+            .with_extra_upload_roots(vec![work_dir.clone()]);
 
         // Sidebar ordering store (`user_order` table). Built early so it can be
         // shared by the conversation delete hook, the team service, and the

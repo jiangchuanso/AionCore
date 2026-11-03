@@ -29,7 +29,9 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_file::{
+    FileRouterState, FileService, IUploadWorkspaceLookup, SnapshotService, UploadWorkspaceLookupRef,
+};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -540,11 +542,32 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
     }
 }
 
+/// Adapter over the conversation service: resolves the on-disk workspace of a
+/// conversation so `/api/fs/upload` can store client attachments inside the
+/// conversation folder instead of the process-wide temp directory.
+struct ConversationUploadWorkspace {
+    service: ConversationService,
+}
+
+#[async_trait::async_trait]
+impl IUploadWorkspaceLookup for ConversationUploadWorkspace {
+    async fn workspace_for(&self, user_id: &str, conversation_id: &str) -> Option<std::path::PathBuf> {
+        self.service.workspace_for(user_id, conversation_id).await
+    }
+}
+
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
+    let upload_workspace_lookup: UploadWorkspaceLookupRef = Arc::new(ConversationUploadWorkspace {
+        service: services.conversation_service.clone(),
+    });
+    let file_service = Arc::new(
+        FileService::new(broadcaster.clone(), allowed_roots.clone())
+            .with_upload_root(services.work_dir.clone())
+            .with_upload_workspace_lookup(upload_workspace_lookup),
+    );
     let snapshot_service = Arc::new(SnapshotService::new());
     // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
     // `/api/fs/open-system` (open with the default application): adapters over one

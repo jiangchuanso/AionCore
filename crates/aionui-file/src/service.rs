@@ -22,6 +22,10 @@ use crate::types::{
 /// Maximum number of files returned by `list_workspace_files`.
 const MAX_WORKSPACE_FILES: usize = 20_000;
 
+/// Sub-directory of a conversation workspace that receives client uploads, so
+/// attachments are kept apart from the files the agent produces.
+const UPLOAD_SUBDIR: &str = "uploads";
+
 /// Maximum file size for read operations (256 MB).
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -64,6 +68,12 @@ pub struct FileService {
     allowed_roots: Vec<std::path::PathBuf>,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
     workspace_files_cache: DashMap<String, Vec<WorkspaceFlatFile>>,
+    /// Root that receives uploads when no conversation workspace is available
+    /// (e.g. `{work_dir}`). `None` keeps the legacy temp-dir behaviour.
+    upload_root: Option<std::path::PathBuf>,
+    /// Resolves a conversation's workspace so uploads land in the conversation
+    /// folder instead of a process-wide temp directory.
+    upload_workspace_lookup: Option<crate::traits::UploadWorkspaceLookupRef>,
 }
 
 impl FileService {
@@ -72,7 +82,24 @@ impl FileService {
             broadcaster,
             allowed_roots,
             workspace_files_cache: DashMap::new(),
+            upload_root: None,
+            upload_workspace_lookup: None,
         }
+    }
+
+    /// Set the directory that owns upload staging space (`{work_dir}`).
+    pub fn with_upload_root(mut self, upload_root: std::path::PathBuf) -> Self {
+        self.upload_root = Some(upload_root);
+        self
+    }
+
+    /// Inject the conversation-workspace resolver used by uploads.
+    pub fn with_upload_workspace_lookup(
+        mut self,
+        lookup: crate::traits::UploadWorkspaceLookupRef,
+    ) -> Self {
+        self.upload_workspace_lookup = Some(lookup);
+        self
     }
 
     /// Invalidate the workspace files cache for a given root.
@@ -875,6 +902,7 @@ impl crate::traits::IFileService for FileService {
         &self,
         file_name: &str,
         data: &[u8],
+        user_id: Option<&str>,
         conversation_id: Option<&str>,
     ) -> Result<String, FileError> {
         if file_name.is_empty() {
@@ -910,13 +938,34 @@ impl crate::traits::IFileService for FileService {
         let name = file_name.to_owned();
         let bytes = data.to_vec();
 
+        let upload_root = self
+            .upload_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("aionui"));
+
+        // Prefer the conversation workspace so the upload lands next to the files
+        // the agent produces for that conversation. Falls back to a staging area
+        // under the upload root (never the process temp dir) when the workspace
+        // is unknown — e.g. uploads made on the new-conversation screen.
+        //
+        // Only workspaces inside the upload root are used: the chat-file
+        // containment check accepts the upload root (plus the conversation
+        // workspace under it), so a workspace outside it would make the
+        // attachment unreadable after upload.
+        let workspace = match (user_id, conv_id.as_deref(), self.upload_workspace_lookup.as_ref()) {
+            (Some(user_id), Some(conversation_id), Some(lookup)) => lookup
+                .workspace_for(user_id, conversation_id)
+                .await
+                .filter(|workspace| workspace.starts_with(&upload_root)),
+            _ => None,
+        };
+
         tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
-            if let Some(conv_id) = conv_id.as_deref() {
-                dir = dir.join(conv_id);
-            } else {
-                dir = dir.join("general");
-            }
+            let dir = match (workspace, conv_id.as_deref()) {
+                (Some(workspace), _) => workspace.join(UPLOAD_SUBDIR),
+                (None, Some(conversation_id)) => upload_root.join(UPLOAD_SUBDIR).join(conversation_id),
+                (None, None) => upload_root.join(UPLOAD_SUBDIR).join("staging"),
+            };
             std::fs::create_dir_all(&dir)
                 .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
 

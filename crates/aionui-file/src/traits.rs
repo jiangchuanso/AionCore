@@ -93,17 +93,22 @@ pub trait IFileService: Send + Sync {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
 
-    /// Write `data` to a temporary file and return its absolute path.
+    /// Write `data` to a per-conversation upload directory and return its
+    /// absolute path.
     ///
-    /// When `conversation_id` is provided, the file is placed under a
-    /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used.
+    /// When the conversation's workspace can be resolved, the file is written to
+    /// `<workspace>/uploads/` so it sits next to everything else the
+    /// conversation produces. Otherwise it falls back to
+    /// `<upload_root>/uploads/<conversation_id>/`, and to
+    /// `<upload_root>/uploads/staging/` when no conversation is known yet
+    /// (uploading from the new-conversation screen).
     ///
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(
         &self,
         file_name: &str,
         data: &[u8],
+        user_id: Option<&str>,
         conversation_id: Option<&str>,
     ) -> Result<String, FileError>;
 
@@ -179,6 +184,22 @@ pub trait ISnapshotService: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped file service.
 pub type FileServiceRef = Arc<dyn IFileService>;
+
+/// Resolves the on-disk workspace of a conversation.
+///
+/// Uploads use it so client-attached files land inside the conversation folder
+/// (next to everything the agent produces there) instead of the process-wide
+/// temp directory. Implemented by the composition layer over the conversation
+/// store, keeping `aionui-file` free of database dependencies.
+#[async_trait::async_trait]
+pub trait IUploadWorkspaceLookup: Send + Sync {
+    /// Return the persisted workspace path of `conversation_id`, or `None` when
+    /// the conversation is unknown / has no workspace yet.
+    async fn workspace_for(&self, user_id: &str, conversation_id: &str) -> Option<std::path::PathBuf>;
+}
+
+/// Convenience alias for an Arc-wrapped upload workspace lookup.
+pub type UploadWorkspaceLookupRef = Arc<dyn IUploadWorkspaceLookup>;
 
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;

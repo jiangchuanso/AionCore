@@ -108,7 +108,16 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                if !path_within(upload_root, candidate) {
+                // Uploads normally live under the legacy upload root (OS temp),
+                // but conversation-bound uploads are written into the
+                // conversation workspace under the data dir, so those extra
+                // roots are accepted too.
+                let within_upload_root = path_within(upload_root, candidate)
+                    || self
+                        .extra_upload_roots()
+                        .iter()
+                        .any(|root| path_within(root, candidate));
+                if !within_upload_root {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
                 Ok(path.clone())

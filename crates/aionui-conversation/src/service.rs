@@ -4950,6 +4950,21 @@ impl ConversationService {
             .await;
     }
 
+    /// Resolve the persisted workspace directory of a conversation.
+    ///
+    /// Returns `None` when the conversation is unknown or has no workspace
+    /// recorded yet. Used by the file service so client uploads land inside the
+    /// conversation folder instead of a process-wide temp directory.
+    pub async fn workspace_for(&self, user_id: &str, conversation_id: &str) -> Option<std::path::PathBuf> {
+        let row = self.conversation_repo.get(user_id, conversation_id).await.ok()??;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).ok()?;
+        let workspace = extra.get("workspace")?.as_str()?.trim();
+        if workspace.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(workspace))
+    }
+
     /// Write the resolved workspace back to `conversation.extra.workspace` when
     /// the factory picked a different (auto-generated) path than what was stored.
     ///

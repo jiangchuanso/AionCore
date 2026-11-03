@@ -21,6 +21,11 @@ use crate::types::{
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
     temp_root: PathBuf,
+    /// Extra roots that may contain chat uploads besides the caller-supplied
+    /// upload root. Chat attachments now live inside the conversation workspace
+    /// (under the data dir) and in the upload staging area, so containment must
+    /// accept both. Empty keeps the legacy temp-only behaviour.
+    extra_upload_roots: Vec<PathBuf>,
     /// Sink for project-root changes to the source-control actor. Shared across
     /// clones (behind `Arc`) so the one instance the scm monitor installs the
     /// sender on is the same one the HTTP handlers see. Set once at startup;
@@ -34,8 +39,21 @@ impl ProjectService {
         Self {
             store,
             temp_root,
+            extra_upload_roots: Vec::new(),
             scm_roots_tx: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Accept chat uploads from additional roots (conversation workspaces live
+    /// under the data/work directory, not under the OS temp dir).
+    pub fn with_extra_upload_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_upload_roots = roots;
+        self
+    }
+
+    /// Extra upload roots consulted by `resolve_chat_file_ref` containment.
+    pub(crate) fn extra_upload_roots(&self) -> &[PathBuf] {
+        &self.extra_upload_roots
     }
 
     /// Install the sink that carries project-root changes to the source-control

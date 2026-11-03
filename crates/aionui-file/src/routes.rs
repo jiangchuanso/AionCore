@@ -654,6 +654,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -664,7 +665,12 @@ async fn upload_file(
 
     let path = state
         .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+        .create_upload_file(
+            &file_name,
+            &fields.file_data,
+            Some(user.id.as_str()),
+            fields.conversation_id.as_deref(),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(path)))
 }

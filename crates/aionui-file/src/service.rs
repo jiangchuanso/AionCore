@@ -94,10 +94,7 @@ impl FileService {
     }
 
     /// Inject the conversation-workspace resolver used by uploads.
-    pub fn with_upload_workspace_lookup(
-        mut self,
-        lookup: crate::traits::UploadWorkspaceLookupRef,
-    ) -> Self {
+    pub fn with_upload_workspace_lookup(mut self, lookup: crate::traits::UploadWorkspaceLookupRef) -> Self {
         self.upload_workspace_lookup = Some(lookup);
         self
     }

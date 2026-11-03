@@ -29,9 +29,7 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{
-    FileRouterState, FileService, IUploadWorkspaceLookup, SnapshotService, UploadWorkspaceLookupRef,
-};
+use aionui_file::{FileRouterState, FileService, IUploadWorkspaceLookup, SnapshotService, UploadWorkspaceLookupRef};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,

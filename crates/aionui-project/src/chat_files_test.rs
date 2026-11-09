@@ -333,6 +333,81 @@ async fn upload_outside_root_is_rejected() {
     assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }), "got {err:?}");
 }
 
+#[tokio::test]
+async fn server_created_upload_path_is_exempt_only_exactly() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let outside = tempfile::tempdir().unwrap();
+    let promoted = outside.path().join("report.pdf");
+    let sibling = outside.path().join("secret.txt");
+    std::fs::write(&promoted, b"pdf").unwrap();
+    std::fs::write(&sibling, b"x").unwrap();
+
+    let out = service
+        .resolve_chat_message_with_server_uploads(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Upload {
+                path: promoted.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+            &[promoted.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.files, vec![promoted.to_string_lossy().into_owned()]);
+
+    // A different file in the very same directory was not created by the send
+    // boundary, so the exemption must not open the directory to client refs.
+    let err = service
+        .resolve_chat_message_with_server_uploads(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Upload {
+                path: sibling.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+            &[promoted.clone()],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }), "got {err:?}");
+
+    // The default entry point (preview, team sends) never honours exemptions.
+    let err = service
+        .resolve_chat_message(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Upload {
+                path: promoted.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn missing_server_created_upload_is_still_rejected() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let outside = tempfile::tempdir().unwrap();
+    let missing = outside.path().join("gone.pdf");
+
+    let err = service
+        .resolve_chat_message_with_server_uploads(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Upload {
+                path: missing.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+            &[missing],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::ChatFileMissing { .. }), "got {err:?}");
+}
+
 // ── upgrade_chat_file_ref ──────────────────────────────────────────────
 //
 // Turning a `Local` path into `Project{pe_id, relative_path}` when it lives under

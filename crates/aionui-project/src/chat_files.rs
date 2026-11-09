@@ -8,7 +8,7 @@
 //! UI — is unchanged: only the *origin* of the paths moves from the client to
 //! this backend edge.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aionui_api_types::ChatFileRef;
 use aionui_common::constants::AIONUI_FILES_MARKER;
@@ -44,11 +44,38 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_with_server_uploads(user_id, content, files, upload_root, &[]).await
+    }
+
+    /// Like [`resolve_chat_message`](Self::resolve_chat_message), but for send
+    /// boundaries that relocate an upload server-side before resolving it.
+    ///
+    /// `server_upload_paths` lists the exact paths created by that relocation
+    /// (e.g. a staging file moved into a conversation workspace outside every
+    /// managed root). They skip only the `Upload` root-containment check; all
+    /// other refs — including another file in that same directory — still go
+    /// through the normal guards, and every path must be an existing regular
+    /// file. Clients cannot supply this list: the caller derives it from the
+    /// files it just moved.
+    pub async fn resolve_chat_message_with_server_uploads(
+        &self,
+        user_id: &str,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_root: &Path,
+        server_upload_paths: &[PathBuf],
+    ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
-                    .await?,
+                self.resolve_chat_file_ref_with_server_uploads(
+                    user_id,
+                    file,
+                    upload_root,
+                    FileOp::Read,
+                    server_upload_paths,
+                )
+                .await?,
             );
         }
 
@@ -81,6 +108,20 @@ impl ProjectService {
         upload_root: &Path,
         op: FileOp,
     ) -> Result<String, ProjectError> {
+        self.resolve_chat_file_ref_with_server_uploads(user_id, file, upload_root, op, &[]).await
+    }
+
+    /// Shared per-ref core. The exemption list is empty for preview callers and
+    /// send paths without relocation; see
+    /// [`resolve_chat_message_with_server_uploads`](Self::resolve_chat_message_with_server_uploads).
+    async fn resolve_chat_file_ref_with_server_uploads(
+        &self,
+        user_id: &str,
+        file: &ChatFileRef,
+        upload_root: &Path,
+        op: FileOp,
+        server_upload_paths: &[PathBuf],
+    ) -> Result<String, ProjectError> {
         match file {
             ChatFileRef::Project { pe_id, relative_path } => {
                 let resolved = self
@@ -108,11 +149,14 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                // Uploads normally live under the legacy upload root (OS temp),
-                // but conversation-bound uploads are written into the
-                // conversation workspace under the data dir, so those extra
-                // roots are accepted too.
-                let within_upload_root = path_within(upload_root, candidate)
+                // Uploads normally live under the legacy upload root (OS temp) or
+                // one of the data-dir extras. A path the send boundary just created
+                // by moving a verified staging upload is trusted too: its
+                // destination may be a user-selected workspace outside every
+                // configured root. Only exact paths are exempt, so this never
+                // opens the destination directory to client-supplied refs.
+                let within_upload_root = is_server_upload_path(server_upload_paths, candidate)
+                    || path_within(upload_root, candidate)
                     || self
                         .extra_upload_roots()
                         .iter()
@@ -265,6 +309,13 @@ fn path_within(root: &Path, target: &Path) -> bool {
         return false;
     };
     target.starts_with(root)
+}
+
+/// Whether `candidate` is exactly one of the paths the send boundary created
+/// in this call. Exact comparison is deliberate: exempting a whole directory
+/// would let client-supplied refs into a user-selected workspace.
+fn is_server_upload_path(server_upload_paths: &[PathBuf], candidate: &Path) -> bool {
+    server_upload_paths.iter().any(|p| p.as_path() == candidate)
 }
 
 #[cfg(test)]

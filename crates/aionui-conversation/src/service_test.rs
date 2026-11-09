@@ -9681,8 +9681,20 @@ async fn send_message_moves_staging_upload_into_conversation_workspace() {
             .with_extra_upload_roots(vec![work_root.path().to_path_buf()]),
     ));
 
-    let sender = svc.create("user_1", make_create_req()).await.unwrap();
+    // Mirror production assembly: the conversation workspace lives under the
+    // injected work root (`work_dir/conversations/...`). A workspace outside it
+    // would make the promoted upload fail chat-file containment, because the
+    // only extra root registered below is the work root itself.
+    let conversation_workspace = work_root.path().join("conversations").join("conv-1");
+    std::fs::create_dir_all(&conversation_workspace).unwrap();
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": conversation_workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let sender = svc.create("user_1", create_req).await.unwrap();
     let workspace = PathBuf::from(sender.extra["workspace"].as_str().unwrap());
+    assert!(workspace.starts_with(work_root.path()), "fixture must keep the workspace under the work root");
     let staging = work_root.path().join("uploads").join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let source = staging.join("report.pdf");
@@ -9701,6 +9713,84 @@ async fn send_message_moves_staging_upload_into_conversation_workspace() {
     assert!(target.is_file(), "attachment must land in the conversation workspace");
     assert_eq!(std::fs::read(&target).unwrap(), b"pdf".to_vec());
     assert!(!source.exists(), "staging original must be removed");
+}
+
+/// A user-selected workspace may sit outside the data dir. An upload promoted
+/// into it is created by the send boundary, so chat-file containment must accept
+/// that exact path while still rejecting client-supplied paths in the same dir.
+#[tokio::test]
+async fn send_message_accepts_promoted_upload_in_workspace_outside_work_dir() {
+    let work_root = tempfile::tempdir().unwrap();
+    let outside_workspace = tempfile::tempdir().unwrap();
+    let (svc, _bc, _repo, task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+
+    // Production assembly: only the work dir is a registered extra upload root.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user_1', 'local', 'user_1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
+        std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    svc.with_project_service(std::sync::Arc::new(
+        aionui_project::ProjectService::new(store, work_root.path().join("conversations"))
+            .with_extra_upload_roots(vec![work_root.path().to_path_buf()]),
+    ));
+
+    let external_workspace = outside_workspace.path().to_path_buf();
+    let make_req = || {
+        serde_json::from_value::<CreateConversationRequest>(json!({
+            "type": "acp",
+            "extra": { "workspace": external_workspace.to_string_lossy() }
+        }))
+        .unwrap()
+    };
+    let sender = svc.create("user_1", make_req()).await.unwrap();
+    let workspace = PathBuf::from(sender.extra["workspace"].as_str().unwrap());
+    assert!(!workspace.starts_with(work_root.path()), "fixture must place the workspace outside the work dir");
+
+    let staging = work_root.path().join("uploads").join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let source = staging.join("report.pdf");
+    std::fs::write(&source, b"pdf").unwrap();
+
+    let request: SendMessageRequest = serde_json::from_value(json!({
+        "content": "看下这个附件",
+        "files": [{ "kind": "upload", "path": source.to_string_lossy() }],
+    }))
+    .unwrap();
+    svc.send_message("user_1", &sender.id, request, &task_mgr)
+        .await
+        .expect("send succeeds");
+
+    let target = workspace.join("uploads").join("report.pdf");
+    assert!(target.is_file(), "attachment must land in the external workspace");
+    assert_eq!(std::fs::read(&target).unwrap(), b"pdf".to_vec());
+    assert!(!source.exists(), "staging original must be removed");
+
+    // A client-supplied ref into that same directory was not created by this
+    // send, so containment must still reject it.
+    let planted = workspace.join("uploads").join("planted.pdf");
+    std::fs::write(&planted, b"planted").unwrap();
+    let second = svc.create("user_1", make_req()).await.unwrap();
+    let forged: SendMessageRequest = serde_json::from_value(json!({
+        "content": "伪造附件",
+        "files": [{ "kind": "upload", "path": planted.to_string_lossy() }],
+    }))
+    .unwrap();
+    let err = svc
+        .send_message("user_1", &second.id, forged, &task_mgr)
+        .await
+        .unwrap_err();
+    let reason = match &err {
+        ConversationError::BadRequest { reason } => reason.as_str(),
+        other => panic!("expected BadRequest, got {other:?}"),
+    };
+    assert!(reason.contains("outside the managed upload directory"), "unexpected reason: {reason}");
 }
 
 mod session_mentions_integration {

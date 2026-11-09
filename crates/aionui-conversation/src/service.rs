@@ -548,13 +548,13 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: "project service unavailable; cannot resolve file attachments".to_owned(),
             })?;
-        let files = match self.workspace_for(user_id, conversation_id).await {
+        let (files, server_paths) = match self.workspace_for(user_id, conversation_id).await {
             Some(workspace) => promote_staging_uploads(&self.workspace_root, &workspace, files),
-            None => files.to_vec(),
+            None => (files.to_vec(), Vec::new()),
         };
         let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .resolve_chat_message_with_server_uploads(user_id, content, &files, &upload_root, &server_paths)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
@@ -5220,10 +5220,20 @@ fn absolutize_workspace_path(path: &Path) -> PathBuf {
 ///
 /// Once moved the staging path no longer exists, so refs queued or retried
 /// after this send must carry the returned workspace path.
-fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileRef]) -> Vec<ChatFileRef> {
+///
+/// Returns the rewritten refs together with the exact paths this call created.
+/// A user-selected workspace may sit outside the managed upload roots, so the
+/// send boundary must hand those paths to chat-file resolution as server-created
+/// rather than client-supplied (see `resolve_chat_message_with_server_uploads`).
+fn promote_staging_uploads(
+    work_dir: &Path,
+    workspace: &Path,
+    files: &[ChatFileRef],
+) -> (Vec<ChatFileRef>, Vec<PathBuf>) {
     let uploads_root = absolutize_workspace_path(work_dir).join("uploads");
     let target_dir = absolutize_workspace_path(workspace).join("uploads");
     let mut promoted = Vec::with_capacity(files.len());
+    let mut server_upload_paths = Vec::new();
     // One message may reference the same upload twice. Its source is gone after
     // the first move, so reuse the resolved target for the remaining refs.
     let mut moved: HashMap<PathBuf, PathBuf> = HashMap::new();
@@ -5238,6 +5248,7 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
         };
         let source = absolutize_workspace_path(Path::new(path.as_str()));
         if let Some(target) = moved.get(&source) {
+            server_upload_paths.push(target.clone());
             promoted.push(ChatFileRef::Upload {
                 path: target.to_string_lossy().into_owned(),
             });
@@ -5260,6 +5271,7 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
                     "Moved pre-conversation upload into conversation workspace"
                 );
                 moved.insert(source, target.clone());
+                server_upload_paths.push(target.clone());
                 promoted.push(ChatFileRef::Upload {
                     path: target.to_string_lossy().into_owned(),
                 });
@@ -5273,7 +5285,7 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
             }
         }
     }
-    promoted
+    (promoted, server_upload_paths)
 }
 
 /// Move one staging upload into the workspace's `uploads/` directory.
@@ -6622,7 +6634,7 @@ mod tests {
                 path: "/tmp/manual.txt".to_owned(),
             },
         ];
-        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+        let (promoted, _) = promote_staging_uploads(&work_dir, &workspace, &files);
 
         let expected = workspace.join("uploads").join("report.pdf");
         assert_eq!(
@@ -6656,7 +6668,7 @@ mod tests {
                 path: source.to_string_lossy().into_owned(),
             },
         ];
-        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+        let (promoted, _) = promote_staging_uploads(&work_dir, &workspace, &files);
 
         let expected = workspace.join("uploads").join("report.pdf");
         assert_eq!(
@@ -6693,7 +6705,7 @@ mod tests {
                 path: second.to_string_lossy().into_owned(),
             },
         ];
-        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+        let (promoted, _) = promote_staging_uploads(&work_dir, &workspace, &files);
 
         let uploads = workspace.join("uploads");
         let target_a = uploads.join("report.pdf");
@@ -6728,7 +6740,9 @@ mod tests {
         let files = vec![ChatFileRef::Upload {
             path: bound.to_string_lossy().into_owned(),
         }];
-        assert_eq!(promote_staging_uploads(&work_dir, &workspace, &files), files);
+        let (promoted, server_upload_paths) = promote_staging_uploads(&work_dir, &workspace, &files);
+        assert_eq!(promoted, files);
+        assert!(server_upload_paths.is_empty(), "no upload was moved");
         assert!(bound.is_file());
     }
 
@@ -6745,7 +6759,9 @@ mod tests {
         let files = vec![ChatFileRef::Upload {
             path: legacy.to_string_lossy().into_owned(),
         }];
-        assert_eq!(promote_staging_uploads(&work_dir, &workspace, &files), files);
+        let (promoted, server_upload_paths) = promote_staging_uploads(&work_dir, &workspace, &files);
+        assert_eq!(promoted, files);
+        assert!(server_upload_paths.is_empty(), "no upload was moved");
         assert!(legacy.is_file());
     }
 

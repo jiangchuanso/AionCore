@@ -524,8 +524,9 @@ impl ConversationService {
     /// project service.
     ///
     /// Uploads made before a conversation exists live in the shared staging
-    /// area; they are copied into this conversation's workspace first so the
-    /// attachment ends up alongside the files the agent produces here.
+    /// area; they are moved into this conversation's workspace first so the
+    /// attachment ends up alongside the files the agent produces here without
+    /// keeping a second copy on disk.
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
@@ -5207,19 +5208,25 @@ fn absolutize_workspace_path(path: &Path) -> PathBuf {
     std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 }
 
-/// Copy uploads that landed outside the conversation workspace into it.
+/// Move uploads that landed outside the conversation workspace into it.
 ///
 /// `/api/fs/upload` writes to `{work_dir}/uploads/staging/` when the client
 /// cannot supply a `conversation_id` yet, and to `uploads/{conversation_id}/`
 /// when the conversation has no persisted workspace. Nothing relocates those
 /// files afterwards: the send boundary only inlines the path, so the
-/// attachment never appears in the conversation directory. Copying here fixes
-/// that without changing the upload API. The original is kept so queued or
-/// retried refs still carrying the old path remain readable.
+/// attachment never appears in the conversation directory. Moving here fixes
+/// that without changing the upload API, and removes the staging original so
+/// each attachment occupies storage once instead of twice.
+///
+/// Once moved the staging path no longer exists, so refs queued or retried
+/// after this send must carry the returned workspace path.
 fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileRef]) -> Vec<ChatFileRef> {
     let uploads_root = absolutize_workspace_path(work_dir).join("uploads");
     let target_dir = absolutize_workspace_path(workspace).join("uploads");
     let mut promoted = Vec::with_capacity(files.len());
+    // One message may reference the same upload twice. Its source is gone after
+    // the first move, so reuse the resolved target for the remaining refs.
+    let mut moved: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for file in files {
         let path = match file {
@@ -5230,6 +5237,12 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
             }
         };
         let source = absolutize_workspace_path(Path::new(path.as_str()));
+        if let Some(target) = moved.get(&source) {
+            promoted.push(ChatFileRef::Upload {
+                path: target.to_string_lossy().into_owned(),
+            });
+            continue;
+        }
         let Some(name) = source.file_name() else {
             promoted.push(file.clone());
             continue;
@@ -5239,19 +5252,22 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
             continue;
         }
 
-        match copy_upload_into_workspace(&target_dir, &source, name) {
+        match move_upload_into_workspace(&target_dir, &source, name) {
             Ok(target) => {
                 info!(
                     workspace = %target_dir.display(),
                     file = %name.to_string_lossy(),
-                    "Copied pre-conversation upload into conversation workspace"
+                    "Moved pre-conversation upload into conversation workspace"
                 );
-                promoted.push(ChatFileRef::Upload { path: target.to_string_lossy().into_owned() });
+                moved.insert(source, target.clone());
+                promoted.push(ChatFileRef::Upload {
+                    path: target.to_string_lossy().into_owned(),
+                });
             }
             Err(err) => {
                 warn!(
                     error = %err,
-                    "Failed to copy pre-conversation upload into workspace; keeping staging path"
+                    "Failed to move pre-conversation upload into workspace; keeping staging path"
                 );
                 promoted.push(file.clone());
             }
@@ -5260,13 +5276,52 @@ fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileR
     promoted
 }
 
-fn copy_upload_into_workspace(target_dir: &Path, source: &Path, name: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+/// Move one staging upload into the workspace's `uploads/` directory.
+///
+/// `rename` keeps the data in place on the same volume. Cross-volume moves
+/// (and filesystems without atomic rename) fall back to copy + delete so the
+/// staging original is still reclaimed. A name collision means a *different*
+/// source with the same file name: pick a unique name rather than overwriting
+/// either file.
+fn move_upload_into_workspace(target_dir: &Path, source: &Path, name: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(target_dir)?;
-    let target = target_dir.join(name);
-    // Idempotent: staging file names are already unique, so an existing target
-    // can only be this same upload promoted by an earlier send.
-    if !target.exists() {
-        std::fs::copy(source, &target)?;
+
+    let original = Path::new(name);
+    let stem = original.file_stem().unwrap_or(std::ffi::OsStr::new("")).to_string_lossy();
+    let extension = original.extension().map(|ext| ext.to_string_lossy());
+    let mut candidate = original.to_path_buf();
+    let mut counter: u32 = 2;
+    let target = loop {
+        let path = target_dir.join(&candidate);
+        if !path.exists() {
+            break path;
+        }
+        candidate = match extension.as_ref() {
+            Some(ext) => PathBuf::from(format!("{stem}({counter}).{ext}")),
+            None => PathBuf::from(format!("{stem}({counter})")),
+        };
+        counter += 1;
+        if counter > 1000 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "too many name collisions for upload promotion",
+            ));
+        }
+    };
+
+    if let Err(rename_error) = std::fs::rename(source, &target) {
+        warn!(
+            error = %rename_error,
+            "Upload promotion rename failed; falling back to copy-and-delete"
+        );
+        if let Err(copy_error) = std::fs::copy(source, &target) {
+            let _ = std::fs::remove_file(&target);
+            return Err(copy_error);
+        }
+        if let Err(remove_error) = std::fs::remove_file(source) {
+            let _ = std::fs::remove_file(&target);
+            return Err(remove_error);
+        }
     }
     Ok(target)
 }
@@ -6546,7 +6601,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_staging_uploads_copies_into_conversation_workspace() {
+    fn promote_staging_uploads_moves_into_conversation_workspace() {
         let temp = tempfile::tempdir().unwrap();
         let work_dir = temp.path().join("aionui-data");
         let staging = work_dir.join("uploads").join("staging");
@@ -6557,17 +6612,105 @@ mod tests {
         std::fs::write(&source, b"pdf").unwrap();
 
         let files = vec![
-            ChatFileRef::Upload { path: source.to_string_lossy().into_owned() },
-            ChatFileRef::Local { path: "/tmp/manual.txt".to_owned() },
+            ChatFileRef::Upload {
+                path: source.to_string_lossy().into_owned(),
+            },
+            ChatFileRef::Local {
+                path: "/tmp/manual.txt".to_owned(),
+            },
         ];
         let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
 
         let expected = workspace.join("uploads").join("report.pdf");
-        assert_eq!(promoted[0], ChatFileRef::Upload { path: expected.to_string_lossy().into_owned() });
+        assert_eq!(
+            promoted[0],
+            ChatFileRef::Upload {
+                path: expected.to_string_lossy().into_owned()
+            }
+        );
         assert_eq!(std::fs::read(&expected).unwrap(), b"pdf".to_vec());
         assert_eq!(promoted[1], files[1]);
-        // The staging original stays readable for queued / retried refs.
-        assert!(source.is_file());
+        // The staging original is gone: only one copy is stored.
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn promote_staging_uploads_reuses_target_for_repeated_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("aionui-data");
+        let staging = work_dir.join("uploads").join("staging");
+        let workspace = work_dir.join("conversations").join("aionrs-temp-abc");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = staging.join("report.pdf");
+        std::fs::write(&source, b"pdf").unwrap();
+
+        let files = vec![
+            ChatFileRef::Upload {
+                path: source.to_string_lossy().into_owned(),
+            },
+            ChatFileRef::Upload {
+                path: source.to_string_lossy().into_owned(),
+            },
+        ];
+        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+
+        let expected = workspace.join("uploads").join("report.pdf");
+        assert_eq!(
+            promoted[0],
+            ChatFileRef::Upload {
+                path: expected.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!(promoted[1], promoted[0]);
+        assert_eq!(std::fs::read_dir(expected.parent().unwrap()).unwrap().count(), 1);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn promote_staging_uploads_keeps_both_files_on_name_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("aionui-data");
+        let staging = work_dir.join("uploads").join("staging");
+        let bound = work_dir.join("uploads").join("conv-1");
+        let workspace = work_dir.join("conversations").join("aionrs-temp-abc");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&bound).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = staging.join("report.pdf");
+        let second = bound.join("report.pdf");
+        std::fs::write(&first, b"staging").unwrap();
+        std::fs::write(&second, b"conversation").unwrap();
+
+        let files = vec![
+            ChatFileRef::Upload {
+                path: first.to_string_lossy().into_owned(),
+            },
+            ChatFileRef::Upload {
+                path: second.to_string_lossy().into_owned(),
+            },
+        ];
+        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+
+        let uploads = workspace.join("uploads");
+        let target_a = uploads.join("report.pdf");
+        let target_b = uploads.join("report(2).pdf");
+        assert_eq!(
+            promoted[0],
+            ChatFileRef::Upload {
+                path: target_a.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!(
+            promoted[1],
+            ChatFileRef::Upload {
+                path: target_b.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!(std::fs::read(&target_a).unwrap(), b"staging".to_vec());
+        assert_eq!(std::fs::read(&target_b).unwrap(), b"conversation".to_vec());
+        assert!(!first.exists());
+        assert!(!second.exists());
     }
 
     #[test]
@@ -6579,8 +6722,28 @@ mod tests {
         std::fs::create_dir_all(bound.parent().unwrap()).unwrap();
         std::fs::write(&bound, b"pdf").unwrap();
 
-        let files = vec![ChatFileRef::Upload { path: bound.to_string_lossy().into_owned() }];
+        let files = vec![ChatFileRef::Upload {
+            path: bound.to_string_lossy().into_owned(),
+        }];
         assert_eq!(promote_staging_uploads(&work_dir, &workspace, &files), files);
+        assert!(bound.is_file());
+    }
+
+    #[test]
+    fn promote_staging_uploads_leaves_uploads_outside_the_root_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("aionui-data");
+        let workspace = work_dir.join("conversations").join("aionrs-temp-abc");
+        let legacy = temp.path().join("legacy-temp").join("old.png");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&legacy, b"png").unwrap();
+
+        let files = vec![ChatFileRef::Upload {
+            path: legacy.to_string_lossy().into_owned(),
+        }];
+        assert_eq!(promote_staging_uploads(&work_dir, &workspace, &files), files);
+        assert!(legacy.is_file());
     }
 
     #[test]

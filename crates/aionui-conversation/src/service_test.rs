@@ -2768,7 +2768,10 @@ async fn delete_removes_orphan_auto_workspace_without_persisted_workspace() {
     repo.update(
         "user_1",
         &conv.id,
-        &ConversationRowUpdate { extra: Some("{}".to_owned()), ..Default::default() },
+        &ConversationRowUpdate {
+            extra: Some("{}".to_owned()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -9652,6 +9655,54 @@ async fn other_build_failures_keep_the_persisted_session_id() {
 // Lives here rather than beside `session_mentions.rs` because `MockRepo` and
 // the service builders are private to this module. The nested module name
 // keeps `cargo test session_mentions` matching.
+/// Sending an attachment moves it out of the shared staging area into the
+/// conversation workspace, leaving only one copy on disk. Exercises the full
+/// send boundary (promotion + chat-file containment + persistence).
+#[tokio::test]
+async fn send_message_moves_staging_upload_into_conversation_workspace() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, _repo, task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+
+    // Mirror production assembly: uploads under `work_dir` must pass chat-file
+    // containment in addition to the legacy OS-temp upload root.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user_1', 'local', 'user_1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
+        std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    svc.with_project_service(std::sync::Arc::new(
+        aionui_project::ProjectService::new(store, work_root.path().join("conversations"))
+            .with_extra_upload_roots(vec![work_root.path().to_path_buf()]),
+    ));
+
+    let sender = svc.create("user_1", make_create_req()).await.unwrap();
+    let workspace = PathBuf::from(sender.extra["workspace"].as_str().unwrap());
+    let staging = work_root.path().join("uploads").join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let source = staging.join("report.pdf");
+    std::fs::write(&source, b"pdf").unwrap();
+
+    let request: SendMessageRequest = serde_json::from_value(json!({
+        "content": "看下这个附件",
+        "files": [{ "kind": "upload", "path": source.to_string_lossy() }],
+    }))
+    .unwrap();
+    svc.send_message("user_1", &sender.id, request, &task_mgr)
+        .await
+        .expect("send succeeds");
+
+    let target = workspace.join("uploads").join("report.pdf");
+    assert!(target.is_file(), "attachment must land in the conversation workspace");
+    assert_eq!(std::fs::read(&target).unwrap(), b"pdf".to_vec());
+    assert!(!source.exists(), "staging original must be removed");
+}
+
 mod session_mentions_integration {
     use super::*;
     use aionui_api_types::SessionRef;

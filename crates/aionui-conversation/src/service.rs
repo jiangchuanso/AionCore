@@ -522,9 +522,14 @@ impl ConversationService {
     /// Atomic — a bad reference fails the whole send. Empty `files` is a no-op
     /// (content unchanged), so callers without attachments never need the
     /// project service.
+    ///
+    /// Uploads made before a conversation exists live in the shared staging
+    /// area; they are copied into this conversation's workspace first so the
+    /// attachment ends up alongside the files the agent produces here.
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
+        conversation_id: &str,
         content: &str,
         files: &[ChatFileRef],
     ) -> Result<ResolvedChatMessage, ConversationError> {
@@ -542,9 +547,13 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: "project service unavailable; cannot resolve file attachments".to_owned(),
             })?;
+        let files = match self.workspace_for(user_id, conversation_id).await {
+            Some(workspace) => promote_staging_uploads(&self.workspace_root, &workspace, files),
+            None => files.to_vec(),
+        };
         let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(user_id, content, files, &upload_root)
+            .resolve_chat_message(user_id, content, &files, &upload_root)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
@@ -2588,6 +2597,13 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
         let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
+        // Historical rows can have no `extra.workspace` at all, or one baked
+        // under a root that no longer exists. The auto-provisioned directory on
+        // disk is still ours to clean, so locate it by its unique
+        // `{label}-temp-{id}` leaf while the conversation id is still known.
+        if auto_workspace_to_delete.is_none() {
+            auto_workspace_to_delete = find_orphan_auto_workspace(&self.workspace_root, id);
+        }
         // Shared-workspace guard: a forked conversation inherits the parent's
         // auto workspace verbatim (claude keys on-disk sessions by cwd), so
         // deleting the parent must not rip the directory out from under the
@@ -3877,7 +3893,7 @@ impl ConversationService {
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
+            .resolve_message_attachments(user_id, conversation_id, &content_with_sessions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
@@ -5179,6 +5195,82 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
     agent_type.serde_name().to_owned()
 }
 
+/// Resolve a stored workspace/upload path against the process working dir.
+///
+/// `create()` persists `workspace_root.join(...)` verbatim, so a relative work
+/// dir produces a relative `extra.workspace`. Both the upload side and the
+/// delete side must normalise it the same way before comparing paths.
+fn absolutize_workspace_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+}
+
+/// Copy uploads that landed outside the conversation workspace into it.
+///
+/// `/api/fs/upload` writes to `{work_dir}/uploads/staging/` when the client
+/// cannot supply a `conversation_id` yet, and to `uploads/{conversation_id}/`
+/// when the conversation has no persisted workspace. Nothing relocates those
+/// files afterwards: the send boundary only inlines the path, so the
+/// attachment never appears in the conversation directory. Copying here fixes
+/// that without changing the upload API. The original is kept so queued or
+/// retried refs still carrying the old path remain readable.
+fn promote_staging_uploads(work_dir: &Path, workspace: &Path, files: &[ChatFileRef]) -> Vec<ChatFileRef> {
+    let uploads_root = absolutize_workspace_path(work_dir).join("uploads");
+    let target_dir = absolutize_workspace_path(workspace).join("uploads");
+    let mut promoted = Vec::with_capacity(files.len());
+
+    for file in files {
+        let path = match file {
+            ChatFileRef::Upload { path } => path,
+            _ => {
+                promoted.push(file.clone());
+                continue;
+            }
+        };
+        let source = absolutize_workspace_path(Path::new(path.as_str()));
+        let Some(name) = source.file_name() else {
+            promoted.push(file.clone());
+            continue;
+        };
+        if !source.starts_with(&uploads_root) || source.starts_with(&target_dir) || !source.is_file() {
+            promoted.push(file.clone());
+            continue;
+        }
+
+        match copy_upload_into_workspace(&target_dir, &source, name) {
+            Ok(target) => {
+                info!(
+                    workspace = %target_dir.display(),
+                    file = %name.to_string_lossy(),
+                    "Copied pre-conversation upload into conversation workspace"
+                );
+                promoted.push(ChatFileRef::Upload { path: target.to_string_lossy().into_owned() });
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to copy pre-conversation upload into workspace; keeping staging path"
+                );
+                promoted.push(file.clone());
+            }
+        }
+    }
+    promoted
+}
+
+fn copy_upload_into_workspace(target_dir: &Path, source: &Path, name: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(target_dir)?;
+    let target = target_dir.join(name);
+    // Idempotent: staging file names are already unique, so an existing target
+    // can only be this same upload promoted by an earlier send.
+    if !target.exists() {
+        std::fs::copy(source, &target)?;
+    }
+    Ok(target)
+}
+
 fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
     let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
     let now = chrono::Local::now();
@@ -5202,26 +5294,80 @@ fn auto_provisioned_workspace_to_delete(
         return None;
     }
 
-    let workspace_path = Path::new(workspace);
-    if !workspace_path.is_absolute() {
-        return None;
-    }
+    // `create()` persists the path verbatim. A relative work dir therefore
+    // yields a relative `extra.workspace`, and rows migrated from a previous
+    // data dir carry a *previous* root entirely. Normalise the former and
+    // classify the latter structurally instead of anchoring on today's root —
+    // the read-side predicate is already root-agnostic for the same reason.
+    let workspace_path = absolutize_workspace_path(Path::new(workspace));
 
-    let conversations_root = workspace_root.join("conversations");
-    let conversations_root = std::fs::canonicalize(conversations_root).ok()?;
-    let workspace_path = std::fs::canonicalize(workspace_path).ok()?;
+    // Only auto-provisioned leaves are safe to delete. Matching the exact
+    // conversation id keeps forks and neighbouring sessions untouched.
     let file_name = workspace_path.file_name()?.to_str()?;
     let expected_suffix = format!("-temp-{conversation_id}");
     if !file_name.ends_with(&expected_suffix) {
         return None;
     }
 
-    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
-    if !is_auto_workspace_relative_path(relative) {
+    let relative = conversations_relative_path(&workspace_path, workspace_root)?;
+    if !is_auto_workspace_relative_path(&relative) {
         return None;
     }
 
-    Some(workspace_path)
+    std::fs::canonicalize(&workspace_path).ok()
+}
+
+/// Path of `workspace` below its `conversations` container, independent of the
+/// configured work dir. Prefers the current root, then falls back to locating
+/// the container inside the stored path itself (rows whose `extra.workspace`
+/// was baked under a previous root still classify correctly).
+fn conversations_relative_path(workspace: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    if let Ok(root) = std::fs::canonicalize(workspace_root.join("conversations"))
+        && let Ok(canonical) = std::fs::canonicalize(workspace)
+        && let Ok(relative) = canonical.strip_prefix(&root)
+    {
+        return Some(relative.to_path_buf());
+    }
+
+    let parts: Vec<_> = workspace.iter().collect();
+    let index = parts.iter().rposition(|part| part.to_str() == Some("conversations"))?;
+    let mut relative = PathBuf::new();
+    for part in &parts[index + 1..] {
+        relative.push(*part);
+    }
+    Some(relative)
+}
+
+/// Find an auto-provisioned workspace by conversation id when `extra.workspace`
+/// is missing or points at a root that no longer exists. Only directories under
+/// `<work_dir>/conversations` whose leaf is exactly `{label}-temp-{id}` are
+/// considered; the shared-workspace guard in `delete()` still applies.
+fn find_orphan_auto_workspace(workspace_root: &Path, conversation_id: &str) -> Option<PathBuf> {
+    let suffix = format!("-temp-{conversation_id}");
+    find_workspace_leaf(&workspace_root.join("conversations"), &suffix, 6)
+}
+
+fn find_workspace_leaf(root: &Path, suffix: &str, depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(suffix))
+        {
+            return Some(path);
+        }
+        if let Some(found) = find_workspace_leaf(&path, suffix, depth - 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// True when `leaf` is an auto-generated workspace directory name. Auto/temp
@@ -5320,9 +5466,8 @@ async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_p
 }
 
 fn date_workspace_parent_dirs(workspace_root: &Path, workspace_path: &Path) -> Option<[PathBuf; 3]> {
-    let conversations_root = std::fs::canonicalize(workspace_root.join("conversations")).ok()?;
-    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
-    if !is_dated_auto_workspace_relative_path(relative) {
+    let relative = conversations_relative_path(workspace_path, workspace_root)?;
+    if !is_dated_auto_workspace_relative_path(&relative) {
         return None;
     }
 
@@ -6398,5 +6543,67 @@ mod tests {
         assert!(policy.http);
         assert!(policy.streamable_http);
         assert!(!policy.sse);
+    }
+
+    #[test]
+    fn promote_staging_uploads_copies_into_conversation_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("aionui-data");
+        let staging = work_dir.join("uploads").join("staging");
+        let workspace = work_dir.join("conversations").join("aionrs-temp-abc");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = staging.join("report.pdf");
+        std::fs::write(&source, b"pdf").unwrap();
+
+        let files = vec![
+            ChatFileRef::Upload { path: source.to_string_lossy().into_owned() },
+            ChatFileRef::Local { path: "/tmp/manual.txt".to_owned() },
+        ];
+        let promoted = promote_staging_uploads(&work_dir, &workspace, &files);
+
+        let expected = workspace.join("uploads").join("report.pdf");
+        assert_eq!(promoted[0], ChatFileRef::Upload { path: expected.to_string_lossy().into_owned() });
+        assert_eq!(std::fs::read(&expected).unwrap(), b"pdf".to_vec());
+        assert_eq!(promoted[1], files[1]);
+        // The staging original stays readable for queued / retried refs.
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn promote_staging_uploads_leaves_conversation_bound_uploads_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("aionui-data");
+        let workspace = work_dir.join("conversations").join("aionrs-temp-abc");
+        let bound = workspace.join("uploads").join("already.pdf");
+        std::fs::create_dir_all(bound.parent().unwrap()).unwrap();
+        std::fs::write(&bound, b"pdf").unwrap();
+
+        let files = vec![ChatFileRef::Upload { path: bound.to_string_lossy().into_owned() }];
+        assert_eq!(promote_staging_uploads(&work_dir, &workspace, &files), files);
+    }
+
+    #[test]
+    fn conversations_relative_path_survives_a_changed_work_dir() {
+        let stored = Path::new("previous/root/conversations/users/u1/2026/11/09/aionrs-temp-abc");
+        let relative = conversations_relative_path(stored, Path::new("current/root")).unwrap();
+        assert_eq!(relative.as_path(), Path::new("users/u1/2026/11/09/aionrs-temp-abc"));
+        assert!(is_auto_workspace_relative_path(&relative));
+    }
+
+    #[test]
+    fn find_orphan_auto_workspace_finds_dated_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let leaf = temp
+            .path()
+            .join("conversations")
+            .join("users")
+            .join("u1")
+            .join("2026")
+            .join("11")
+            .join("09")
+            .join("aionrs-temp-abc");
+        std::fs::create_dir_all(&leaf).unwrap();
+        assert_eq!(find_orphan_auto_workspace(temp.path(), "abc"), Some(leaf));
     }
 }

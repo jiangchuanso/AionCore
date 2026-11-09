@@ -2749,6 +2749,36 @@ async fn delete_removes_auto_provisioned_workspace_directory() {
 }
 
 #[tokio::test]
+async fn delete_removes_orphan_auto_workspace_without_persisted_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {}
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = PathBuf::from(conv.extra["workspace"].as_str().unwrap());
+    assert!(workspace.is_dir());
+
+    // Legacy / imported rows can lose `extra.workspace`. The directory is
+    // still auto-provisioned and must not be orphaned when the row is deleted.
+    repo.update(
+        "user_1",
+        &conv.id,
+        &ConversationRowUpdate { extra: Some("{}".to_owned()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+
+    svc.delete("user_1", &conv.id).await.unwrap();
+
+    assert!(!workspace.exists());
+}
+
+#[tokio::test]
 async fn delete_removes_empty_date_workspace_parents() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");

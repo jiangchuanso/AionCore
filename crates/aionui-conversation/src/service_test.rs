@@ -9694,7 +9694,10 @@ async fn send_message_moves_staging_upload_into_conversation_workspace() {
     .unwrap();
     let sender = svc.create("user_1", create_req).await.unwrap();
     let workspace = PathBuf::from(sender.extra["workspace"].as_str().unwrap());
-    assert!(workspace.starts_with(work_root.path()), "fixture must keep the workspace under the work root");
+    assert!(
+        workspace.starts_with(work_root.path()),
+        "fixture must keep the workspace under the work root"
+    );
     let staging = work_root.path().join("uploads").join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let source = staging.join("report.pdf");
@@ -9751,7 +9754,10 @@ async fn send_message_accepts_promoted_upload_in_workspace_outside_work_dir() {
     };
     let sender = svc.create("user_1", make_req()).await.unwrap();
     let workspace = PathBuf::from(sender.extra["workspace"].as_str().unwrap());
-    assert!(!workspace.starts_with(work_root.path()), "fixture must place the workspace outside the work dir");
+    assert!(
+        !workspace.starts_with(work_root.path()),
+        "fixture must place the workspace outside the work dir"
+    );
 
     let staging = work_root.path().join("uploads").join("staging");
     std::fs::create_dir_all(&staging).unwrap();
@@ -9790,7 +9796,10 @@ async fn send_message_accepts_promoted_upload_in_workspace_outside_work_dir() {
         ConversationError::BadRequest { reason } => reason.as_str(),
         other => panic!("expected BadRequest, got {other:?}"),
     };
-    assert!(reason.contains("outside the managed upload directory"), "unexpected reason: {reason}");
+    assert!(
+        reason.contains("outside the managed upload directory"),
+        "unexpected reason: {reason}"
+    );
 }
 
 mod session_mentions_integration {

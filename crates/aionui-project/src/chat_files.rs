@@ -44,7 +44,8 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
-        self.resolve_chat_message_with_server_uploads(user_id, content, files, upload_root, &[]).await
+        self.resolve_chat_message_with_server_uploads(user_id, content, files, upload_root, &[])
+            .await
     }
 
     /// Like [`resolve_chat_message`](Self::resolve_chat_message), but for send
@@ -108,7 +109,8 @@ impl ProjectService {
         upload_root: &Path,
         op: FileOp,
     ) -> Result<String, ProjectError> {
-        self.resolve_chat_file_ref_with_server_uploads(user_id, file, upload_root, op, &[]).await
+        self.resolve_chat_file_ref_with_server_uploads(user_id, file, upload_root, op, &[])
+            .await
     }
 
     /// Shared per-ref core. The exemption list is empty for preview callers and

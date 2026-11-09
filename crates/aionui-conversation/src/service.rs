@@ -5287,7 +5287,10 @@ fn move_upload_into_workspace(target_dir: &Path, source: &Path, name: &std::ffi:
     std::fs::create_dir_all(target_dir)?;
 
     let original = Path::new(name);
-    let stem = original.file_stem().unwrap_or(std::ffi::OsStr::new("")).to_string_lossy();
+    let stem = original
+        .file_stem()
+        .unwrap_or(std::ffi::OsStr::new(""))
+        .to_string_lossy();
     let extension = original.extension().map(|ext| ext.to_string_lossy());
     let mut candidate = original.to_path_buf();
     let mut counter: u32 = 2;

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use aionui_common::McpSource;
+use toml_edit::{DocumentMut, Table};
+use tracing::{info, warn};
 
 use crate::adapter::{DetectedServer, McpAgentAdapter};
 use crate::error::McpError;
@@ -27,7 +29,7 @@ const CLI_NAME: &str = "aionrs";
 /// KEY = "VALUE"
 ///
 /// [mcp.servers.remote-server]
-/// transport = "http"
+/// transport = "streamable-http"
 /// url = "https://example.com/mcp"
 ///
 /// [mcp.servers.remote-server.headers]
@@ -61,6 +63,26 @@ impl McpAgentAdapter for AionrsAdapter {
             .await
             .map_err(|e| McpError::AgentOperationFailed(format!("failed to read {config_path}: {e}")))?;
 
+        let content = match repair_legacy_transports(&content) {
+            Some(repaired) => {
+                match tokio::fs::write(path, &repaired).await {
+                    Ok(()) => info!(
+                        target: "aionui_mcp",
+                        path = %config_path,
+                        "rewrote legacy MCP transport spelling in aionrs config"
+                    ),
+                    Err(error) => warn!(
+                        target: "aionui_mcp",
+                        path = %config_path,
+                        %error,
+                        "failed to persist repaired MCP transport spelling; using the in-memory repair"
+                    ),
+                }
+                repaired
+            }
+            None => content,
+        };
+
         parse_toml_servers(&content)
     }
 
@@ -76,6 +98,9 @@ impl McpAgentAdapter for AionrsAdapter {
             let content = tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| McpError::AgentOperationFailed(format!("failed to read {config_path}: {e}")))?;
+            // The whole document is rewritten below, so repairing legacy
+            // spellings here persists them together with the new server.
+            let content = repair_legacy_transports(&content).unwrap_or(content);
             content
                 .parse::<toml::Value>()
                 .map_err(|e| McpError::AgentOperationFailed(format!("failed to parse TOML: {e}")))?
@@ -258,7 +283,10 @@ fn parse_toml_server_entry(name: &str, config: &toml::Value) -> Option<DetectedS
             let headers = parse_toml_headers(table);
             McpServerTransport::Sse { url, headers }
         }
-        "http" | "streamable_http" => {
+        // `streamable-http` is the spelling aionrs itself uses (`TransportType` is
+        // kebab-cased); `http` / `streamable_http` are accepted for hand-written
+        // configs and for configs written by older AionUi versions.
+        "http" | "streamable_http" | "streamable-http" => {
             let url = table.get("url")?.as_str()?.to_owned();
             let headers = parse_toml_headers(table);
             McpServerTransport::Http { url, headers }
@@ -315,7 +343,9 @@ fn transport_to_toml(transport: &McpServerTransport) -> toml::Value {
             insert_toml_headers(&mut table, headers);
         }
         McpServerTransport::Http { url, headers } => {
-            table.insert("transport".into(), toml::Value::String("http".into()));
+            // aionrs deserializes `TransportType` with `rename_all = "kebab-case"`,
+            // so the streamable-HTTP variant is only recognized as `streamable-http`.
+            table.insert("transport".into(), toml::Value::String("streamable-http".into()));
             table.insert("url".into(), toml::Value::String(url.clone()));
             insert_toml_headers(&mut table, headers);
         }
@@ -335,6 +365,108 @@ fn insert_toml_headers(table: &mut toml::map::Map<String, toml::Value>, headers:
     }
 }
 
+/// Rewrite MCP transport spellings that aionrs cannot deserialize.
+///
+/// aionrs declares `TransportType` with `#[serde(rename_all = "kebab-case")]`,
+/// so the streamable-HTTP variant is only recognized as `streamable-http`.
+/// Older AionUI releases wrote `transport = "http"`, and hand-written configs
+/// sometimes use `streamable_http`. aionrs treats either as a deserialization
+/// error and discards the **whole** config file, so repairing the spelling is
+/// what makes the rest of the file (providers, models) usable again.
+///
+/// Returns the rewritten document only when something changed. Formatting and
+/// comments survive because the edit is applied to the parsed document rather
+/// than by re-serializing a `toml::Value`.
+fn repair_legacy_transports(content: &str) -> Option<String> {
+    let mut doc: DocumentMut = content.parse().ok()?;
+    if migrate_legacy_transports(&mut doc) == 0 {
+        return None;
+    }
+    Some(doc.to_string())
+}
+
+/// Rewrite every `mcp.servers.*` entry that still uses a spelling or key aionrs
+/// does not deserialize.
+///
+/// - `transport = "http"` / `"streamable_http"` becomes `"streamable-http"`.
+/// - `type = "<recognized transport>"` (the key other MCP clients use) gets a
+///   matching `transport` added. aionrs has no `type` field, so such entries
+///   silently fall back to `stdio` today. `type` itself is kept — it is inert
+///   for aionrs and removing it would also drop any comment on that line.
+///
+/// Values that are not a recognized transport (`local`, `remote`, typos, …) are
+/// left untouched: guessing which protocol they mean would be worse than
+/// leaving the entry as it is.
+///
+/// Returns how many entries were migrated.
+fn migrate_legacy_transports(doc: &mut DocumentMut) -> usize {
+    let Some(servers) = doc
+        .as_table_mut()
+        .get_mut("mcp")
+        .and_then(|mcp| mcp.as_table_mut())
+        .and_then(|mcp| mcp.get_mut("servers"))
+        .and_then(|servers| servers.as_table_mut())
+    else {
+        return 0;
+    };
+
+    let mut migrated = 0;
+    for (_name, server) in servers.iter_mut() {
+        if let Some(table) = server.as_table_mut() {
+            if migrate_server_transport(table) {
+                migrated += 1;
+            }
+        }
+    }
+
+    migrated
+}
+
+/// Migrate a single `[mcp.servers.*]` entry. Returns true when it was rewritten.
+fn migrate_server_transport(table: &mut Table) -> bool {
+    if let Some(transport) = table.get_mut("transport") {
+        // A present `transport` always wins; only its spelling is normalized.
+        let Some(value) = transport.as_value_mut() else {
+            return false;
+        };
+        let Some(normalized) = value.as_str().and_then(normalize_transport_spelling) else {
+            return false;
+        };
+        if value.as_str() == Some(normalized) {
+            return false;
+        }
+
+        // Keep the original whitespace and any trailing comment.
+        let decor = value.decor().clone();
+        *value = toml_edit::Value::from(normalized);
+        *value.decor_mut() = decor;
+        return true;
+    }
+
+    // No `transport` yet: promote a recognized `type` key. The `type` key is
+    // kept because aionrs ignores unknown fields, and removing it would also
+    // drop any comment attached to that line.
+    let Some(type_value) = table.get("type").and_then(|item| item.as_value()) else {
+        return false;
+    };
+    let Some(normalized) = type_value.as_str().and_then(normalize_transport_spelling) else {
+        return false;
+    };
+
+    table.insert("transport", toml_edit::Item::Value(toml_edit::Value::from(normalized)));
+    true
+}
+
+/// Map the spellings seen in the wild onto aionrs' `TransportType` names.
+fn normalize_transport_spelling(raw: &str) -> Option<&'static str> {
+    match raw {
+        "http" | "streamable_http" | "streamable-http" => Some("streamable-http"),
+        "stdio" => Some("stdio"),
+        "sse" => Some("sse"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -346,6 +478,137 @@ mod tests {
     #[test]
     fn source_is_aionrs() {
         assert_eq!(AionrsAdapter.source(), McpSource::Aionrs);
+    }
+
+    // -- repair_legacy_transports ---------------------------------------------
+
+    #[test]
+    fn repair_legacy_transports_rewrites_http_and_snake_spellings() {
+        let toml = r#"# aionrs global config
+[provider.openai]
+api_key = "sk-test"
+
+[mcp.servers.legacy-http]
+transport = "http"
+url = "https://a.example/mcp"
+
+[mcp.servers.hand-written]
+transport = "streamable_http"
+url = "https://b.example/mcp"
+
+[mcp.servers.sse-srv]
+transport = "sse"
+url = "https://c.example/sse"
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+
+        assert!(repaired.contains("# aionrs global config"));
+        assert!(repaired.contains(r#"api_key = "sk-test""#));
+        assert_eq!(repaired.matches(r#"transport = "streamable-http""#).count(), 2);
+        assert!(!repaired.contains(r#"transport = "http""#));
+        assert!(!repaired.contains(r#"transport = "streamable_http""#));
+        assert!(repaired.contains(r#"transport = "sse""#));
+    }
+
+    #[test]
+    fn repair_legacy_transports_keeps_trailing_comments() {
+        let toml = r#"[mcp.servers.a]
+transport = "http" # written by an older AionUI
+url = "https://a.example/mcp"
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+
+        assert!(
+            repaired.contains(r#"transport = "streamable-http" # written by an older AionUI"#),
+            "{repaired}"
+        );
+    }
+
+    #[test]
+    fn repair_legacy_transports_promotes_type_onto_transport() {
+        let toml = r#"[mcp.servers.typed]
+type = "http" # copied from another client
+url = "https://a.example/mcp"
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+
+        assert!(repaired.contains(r#"transport = "streamable-http""#), "{repaired}");
+        // `type` is inert for aionrs; keeping it preserves its trailing comment.
+        assert!(
+            repaired.contains(r#"type = "http" # copied from another client"#),
+            "{repaired}"
+        );
+    }
+
+    #[test]
+    fn repair_legacy_transports_promotes_type_stdio() {
+        let toml = r#"[mcp.servers.local]
+type = "stdio"
+command = "npx"
+args = ["-y", "srv"]
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+
+        assert!(repaired.contains(r#"transport = "stdio""#), "{repaired}");
+        let servers = parse_toml_servers(&repaired).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(matches!(servers[0].transport, McpServerTransport::Stdio { .. }));
+    }
+
+    #[test]
+    fn repair_legacy_transports_leaves_unknown_type_untouched() {
+        let toml = r#"[mcp.servers.remote]
+type = "remote"
+url = "https://a.example/mcp"
+"#;
+
+        assert!(repair_legacy_transports(toml).is_none());
+    }
+
+    #[test]
+    fn repair_legacy_transports_ignores_commented_examples() {
+        let toml = r#"# transport = "http"
+[mcp.servers.a]
+transport = "streamable-http"
+url = "https://a.example/mcp"
+"#;
+
+        assert!(repair_legacy_transports(toml).is_none());
+    }
+
+    #[test]
+    fn repair_legacy_transports_is_idempotent() {
+        let toml = r#"[mcp.servers.a]
+transport = "http"
+url = "https://a.example/mcp"
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+
+        assert!(repair_legacy_transports(&repaired).is_none());
+    }
+
+    #[test]
+    fn repair_legacy_transports_returns_none_for_unparsable_input() {
+        assert!(repair_legacy_transports("[mcp.servers.a").is_none());
+    }
+
+    #[test]
+    fn repaired_config_parses_as_http_transport() {
+        let toml = r#"[mcp.servers.remote]
+transport = "http"
+url = "https://example.com/mcp"
+"#;
+
+        let repaired = repair_legacy_transports(toml).expect("should migrate");
+        let servers = parse_toml_servers(&repaired).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert!(matches!(servers[0].transport, McpServerTransport::Http { .. }));
     }
 
     // -- parse_toml_servers ---------------------------------------------------
@@ -477,6 +740,19 @@ url = "https://example.com/api"
     }
 
     #[test]
+    fn parse_kebab_streamable_http_becomes_http() {
+        // aionrs' own spelling (`TransportType` is kebab-cased).
+        let toml = r#"
+[mcp.servers.sh]
+transport = "streamable-http"
+url = "https://example.com/api"
+"#;
+        let servers = parse_toml_servers(toml).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(matches!(servers[0].transport, McpServerTransport::Http { .. }));
+    }
+
+    #[test]
     fn parse_unknown_transport_skipped() {
         let toml = r#"
 [mcp.servers.ws]
@@ -562,8 +838,37 @@ args = ["srv.js"]
             headers: HashMap::from([("Authorization".into(), "Bearer tok".into())]),
         };
         let toml_val = transport_to_toml(&transport);
+        // aionrs only accepts the kebab-case spelling for streamable HTTP.
+        assert_eq!(
+            toml_val.as_table().unwrap().get("transport").unwrap().as_str().unwrap(),
+            "streamable-http"
+        );
         let server = parse_toml_server_entry("test", &toml_val).unwrap();
         assert_eq!(server.transport, transport);
+    }
+
+    #[test]
+    fn http_transport_serialized_document_uses_kebab_spelling() {
+        // `install_server` writes the whole document; this spelling is what aionrs'
+        // kebab-cased `TransportType` deserializes into `StreamableHttp`.
+        let mut servers = toml::map::Map::new();
+        servers.insert(
+            "sqlrest".to_string(),
+            transport_to_toml(&McpServerTransport::Http {
+                url: "http://127.0.0.1:8090/mcp".into(),
+                headers: HashMap::new(),
+            }),
+        );
+
+        let mut mcp = toml::map::Map::new();
+        mcp.insert("servers".to_string(), toml::Value::Table(servers));
+
+        let mut root = toml::map::Map::new();
+        root.insert("mcp".to_string(), toml::Value::Table(mcp));
+
+        let text = toml::to_string_pretty(&toml::Value::Table(root)).unwrap();
+        assert!(text.contains(r#"transport = "streamable-http""#), "{text}");
+        assert!(!text.contains(r#"transport = "http""#), "{text}");
     }
 
     #[test]

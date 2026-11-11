@@ -209,7 +209,8 @@ fn parse_standard_list_line_inner_rest(rest: &str) -> Option<DetectedServer> {
             url: command_or_url.to_owned(),
             headers: HashMap::new(),
         },
-        "http" | "streamable_http" => McpServerTransport::Http {
+        // `streamable-http` matches aionrs' kebab-cased `TransportType` spelling.
+        "http" | "streamable_http" | "streamable-http" => McpServerTransport::Http {
             url: command_or_url.to_owned(),
             headers: HashMap::new(),
         },
@@ -321,6 +322,20 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert!(!servers[0].importable);
         assert_eq!(servers[0].import_skip_reason.as_deref(), Some("Disconnected"));
+    }
+
+    #[test]
+    fn parse_standard_list_streamable_http_kebab() {
+        let output = "✓ remote-srv: https://example.com/mcp (streamable-http) - Connected";
+        let servers = parse_standard_list_output(output);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].importable);
+        match &servers[0].transport {
+            McpServerTransport::Http { url, .. } => {
+                assert_eq!(url, "https://example.com/mcp");
+            }
+            _ => panic!("expected Http"),
+        }
     }
 
     #[test]

@@ -193,6 +193,8 @@ rustls-webpki = "0.103.13"
 # OAuth / MCP
 oauth2 = "5.0.0-rc.1"
 toml = "0.8"
+# Format-preserving TOML edits (already in the tree through `toml`).
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 
 # Ed25519
 ed25519-dalek = { version = "2", features = ["rand_core"] }

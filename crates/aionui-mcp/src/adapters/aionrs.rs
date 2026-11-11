@@ -412,7 +412,9 @@ fn migrate_legacy_transports(doc: &mut DocumentMut) -> usize {
 
     let mut migrated = 0;
     for (_name, server) in servers.iter_mut() {
-        if let Some(table) = server.as_table_mut() && migrate_server_transport(table) {
+        if let Some(table) = server.as_table_mut()
+            && migrate_server_transport(table)
+        {
             migrated += 1;
         }
     }

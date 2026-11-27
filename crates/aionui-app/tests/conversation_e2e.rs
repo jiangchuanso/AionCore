@@ -269,7 +269,8 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
         .unwrap();
     assert_eq!(snapshot.assistant_id, assistant_id);
     assert_eq!(snapshot.agent_id, "8e1acf31");
-    assert_eq!(snapshot.rules_content, "zh-TW fallback snapshot rule");
+    assert!(snapshot.rules_content.ends_with("zh-TW fallback snapshot rule"));
+    assert!(snapshot.rules_content.contains("English"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
     assert_eq!(snapshot.resolved_mcp_ids, r#"["override-mcp"]"#);

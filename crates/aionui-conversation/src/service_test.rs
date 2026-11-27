@@ -50,7 +50,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::service::ConversationService;
+use crate::service::{ConversationService, locale_thinking_instruction};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
@@ -7863,7 +7863,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
     assert_eq!(snapshot.assistant_id, "preset-1");
     assert_eq!(snapshot.agent_id, "8e1acf31");
-    assert_eq!(snapshot.rules_content, "assistant rule body");
+    assert!(snapshot.rules_content.ends_with("assistant rule body"));
+    assert!(snapshot.rules_content.contains("简体中文"));
     assert_eq!(snapshot.default_model_mode, "auto");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
     assert_eq!(snapshot.default_skills_mode, "auto");
@@ -8165,7 +8166,9 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
 
     match options.context.kind {
         AgentSessionKind::Acp(ctx) => {
-            assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
+            let rules = ctx.config.preset_context.as_deref().expect("preset context");
+            assert!(rules.ends_with("assistant rule body"));
+            assert!(rules.contains("English"));
         }
         AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
             panic!("test conversation should build ACP options")
@@ -8212,9 +8215,34 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
             panic!("test conversation should build Aionrs options")
         }
         AgentSessionKind::Aionrs(ctx) => {
-            assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
+            let rules = ctx.config.preset_rules.as_deref().expect("preset rules");
+            assert!(rules.ends_with("assistant rule body"));
+            assert!(rules.contains("English"));
         }
     }
+}
+
+#[test]
+fn locale_thinking_instruction_covers_supported_ui_locales() {
+    assert!(locale_thinking_instruction(Some("zh-CN"))
+        .expect("zh-CN directive")
+        .contains("简体中文"));
+    assert!(locale_thinking_instruction(Some("zh-TW"))
+        .expect("zh-TW directive")
+        .contains("繁體中文"));
+    assert!(locale_thinking_instruction(Some("en-US"))
+        .expect("en-US directive")
+        .contains("English"));
+    assert!(locale_thinking_instruction(Some("ja-JP"))
+        .expect("non-Chinese locales use English")
+        .contains("English"));
+    assert!(locale_thinking_instruction(Some("xx-XX"))
+        .expect("unknown locale uses English")
+        .contains("English"));
+    assert!(locale_thinking_instruction(Some("zh-CN"))
+        .expect("zh-CN directive")
+        .contains("工具调用"));
+    assert!(locale_thinking_instruction(None).is_none());
 }
 
 #[tokio::test]

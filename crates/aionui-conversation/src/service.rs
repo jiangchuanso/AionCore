@@ -72,6 +72,25 @@ const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
+const ZH_CN_THINKING_INSTRUCTION: &str =
+    "请始终使用简体中文撰写面向用户的文字，包括内部思考/推理过程（<think> 标签内的内容）、解释和最终回答。不要使用英文思考。工具调用的参数、命令、文件路径、代码和标识符保持原样，不要翻译成中文。";
+const ZH_TW_THINKING_INSTRUCTION: &str =
+    "請始終使用繁體中文撰寫面向使用者的文字，包括內部思考/推理過程（<think> 標籤內的內容）、說明與最終回答。不要使用英文思考。工具呼叫的參數、命令、檔案路徑、程式碼和識別項保持原樣，不要翻譯成中文。";
+const EN_THINKING_INSTRUCTION: &str =
+    "Always think and respond in English, including the content inside <think> tags, explanations, and the final answer. Do not reason in another language. Keep tool-call arguments, commands, file paths, code, and identifiers verbatim; do not translate them.";
+
+/// Language directive prepended to the frozen assistant-rule snapshot. Chinese
+/// locales get a Chinese directive; every other UI locale gets English, since
+/// most models only reason reliably in Chinese or English. `None` means no
+/// locale was supplied, in which case no directive is injected.
+pub(crate) fn locale_thinking_instruction(locale: Option<&str>) -> Option<&'static str> {
+    match locale? {
+        "zh-TW" | "zh-Hant" => Some(ZH_TW_THINKING_INSTRUCTION),
+        locale if locale.starts_with("zh") => Some(ZH_CN_THINKING_INSTRUCTION),
+        _ => Some(EN_THINKING_INSTRUCTION),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct AssistantConversationOverrides {
     #[serde(default)]
@@ -1771,6 +1790,16 @@ impl ConversationService {
             .and_then(serde_json::Value::as_str)
             .or_else(|| extra.get("preset_rules").and_then(serde_json::Value::as_str))
             .unwrap_or_default();
+        let rules_content = if rules_content.is_empty() {
+            fallback_rules.to_owned()
+        } else {
+            rules_content
+        };
+        let rules_content = match locale_thinking_instruction(locale) {
+            Some(instruction) if !rules_content.trim().is_empty() => format!("{instruction}\n\n{rules_content}"),
+            Some(instruction) => instruction.to_owned(),
+            None => rules_content,
+        };
         let effective_agent_id = state
             .as_ref()
             .and_then(|row| row.agent_id_override.clone())
@@ -1794,13 +1823,7 @@ impl ConversationService {
             agent_source: agent_binding.agent_source,
             runtime_backend: agent_binding.runtime_backend,
             agent_type,
-            rules: AssistantSnapshotRules {
-                content: if rules_content.is_empty() {
-                    fallback_rules.to_owned()
-                } else {
-                    rules_content
-                },
-            },
+            rules: AssistantSnapshotRules { content: rules_content },
             default_modes: AssistantSnapshotDefaultModes {
                 model: definition.default_model_mode.clone(),
                 permission: definition.default_permission_mode.clone(),
